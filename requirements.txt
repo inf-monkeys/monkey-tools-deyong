@@ -1,0 +1,16 @@
+flask==2.1.2
+flask-cors==4.0.0
+flask_restx==0.5.1
+python-docx==0.8.11
+requests==2.31.0
+aiohttp
+asyncio
+lxml>=3.1.0
+typing-extensions
+tencentcloud-sdk-python==3.0.820
+werkzeug==2.1.2
+openai
+python-dotenv==1.0.0
+matplotlib==3.7.2
+streamlit==1.31.0
+numpy
