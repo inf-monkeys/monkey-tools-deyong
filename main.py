@@ -13,9 +13,12 @@ import io
 import json
 import asyncio
 import aiohttp
+import re
+import time
 from typing import List, Dict, Any
 from lxml import etree
 from werkzeug.utils import secure_filename
+from datetime import datetime
 
 # 导入腾讯云OCR SDK
 # 注意：需要安装 tencentcloud-sdk-python
@@ -253,6 +256,15 @@ class DocumentTranslationResource(Resource):
             "x-monkey-tool-input": [
                 {
                     "displayName": {
+                        "zh-CN": "Cursor AI API密钥",
+                        "en-US": "Cursor AI API Key",
+                    },
+                    "name": "api_key",
+                    "type": "string",
+                    "required": True,
+                },
+                {
+                    "displayName": {
                         "zh-CN": "Word文档",
                         "en-US": "Word Document",
                     },
@@ -293,20 +305,15 @@ class DocumentTranslationResource(Resource):
                 "estimateTime": 30,
                 "provider": "GPT-4o"
             },
-            "x-monkey-tool-credentials": [
-                {
-                    "name": "cursor-ai",
-                    "required": True,
-                    "description": {
-                        "zh-CN": "Cursor AI API 密钥",
-                        "en-US": "Cursor AI API Key"
-                    }
-                }
-            ]
+            "x-monkey-tool-extra": {
+                "estimateTime": 10,
+                "provider": "GPT-o3",
+            }
         }
     )
     @ai_translation_ns.expect(
         ai_translation_ns.parser().add_argument('document', location='files', type='file', required=True, help='Word document file')
+        .add_argument('api_key', location='form', type=str, required=True, help='Cursor AI API Key')
         .add_argument('target_language', location='form', type=str, required=True, help='Target language for translation')
         .add_argument('special_requirements', location='form', type=str, required=False, help='Special translation requirements')
     )
@@ -320,16 +327,15 @@ class DocumentTranslationResource(Resource):
         Returns a Word document with the translated content.
         """
         try:
-            # 从请求头获取 API Key
-            api_key = request.headers.get("x-monkey-credential-cursor-ai")
-            if not api_key:
-                return {"error": "Missing API key"}, 401
-
             # Get uploaded file
             if 'document' not in request.files:
                 return {"error": "No document file provided"}, 400
                 
             file = request.files['document']
+            api_key = request.form.get('api_key')
+            if not api_key:
+                return {"error": "Missing API key"}, 401
+                
             target_language = request.form.get('target_language')
             special_requirements = request.form.get('special_requirements', '')
             
@@ -349,7 +355,7 @@ class DocumentTranslationResource(Resource):
             file.save(input_file_path)
             
             # Process the document
-            translated_doc = self.translate_document(input_file_path, target_language, special_requirements)
+            translated_doc = self.translate_document(input_file_path, target_language, special_requirements, api_key)
             translated_doc.save(output_file_path)
             
             # Return the translated document
@@ -363,6 +369,373 @@ class DocumentTranslationResource(Resource):
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}, 500
+
+    async def translate_text_async(self, text, session, target_language, special_requirements="", api_key=None):
+        """
+        使用 GPT-4o API 异步翻译中文文本
+        
+        Args:
+            text: 要翻译的文本
+            session: aiohttp 客户端会话
+            target_language: 目标语言
+            special_requirements: 特殊翻译要求
+        
+        Returns:
+            翻译后的文本
+        """
+        if not text.strip():
+            return ""
+        
+        # 检查是否为单独的字符或阿拉伯数字
+        if len(text.strip()) <= 1 or text.strip().isdigit():
+            return text
+        
+        # 检查是否为特定词语
+        # if text.strip() in SPECIAL_TRANSLATIONS:
+        #     return SPECIAL_TRANSLATIONS[text.strip()]
+        
+        try:
+            # 构建 API 请求
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }
+            
+            # 新的OpenAI API格式要求有user参数
+            data = {
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": f"你是一个专业的中文到{target_language}翻译器。请将用户提供的中文文本翻译成{target_language}，只输出翻译结果，不要有任何解释或额外内容。保持原始格式，但不要重复原文中的标点符号，特别是在行尾的标点符号。如果原文中有标点符号，请使用{target_language}中的对应标点符号，而不是重复使用原文的标点符号。如果遇到单独的字母或数字，请保持原样不翻译。如果文本中包含“百”、“千”、“万”等数字单位，请按照特定规则翻译。{special_requirements if special_requirements else ''}"},
+                    {"role": "user", "content": text}
+                ],
+                "temperature": 0.3,
+                "user": "translation_service"  # 添加user参数以满足API要求
+            }
+            
+            # 发送 API 请求
+            print(f"正在发送翻译请求: {text[:30]}...")
+            async with session.post(f"{API_URL}/v1/chat/completions", headers=headers, json=data) as response:
+                response_data = await response.json()
+                
+                # 处理 API 响应
+                if response.status == 200 and "choices" in response_data:
+                    translated_text = response_data["choices"][0]["message"]["content"]
+                    print(f"翻译成功: {translated_text[:30]}...")
+                    return translated_text
+                else:
+                    print(f"翻译失败: {response.status} - {response_data}")
+                    return ""
+        except Exception as e:
+            print(f"翻译过程中发生错误: {str(e)}")
+            return ""
+
+    async def batch_translate_texts(self, texts, target_language, special_requirements="", api_key=None):
+        """
+        批量异步翻译多个文本
+        
+        Args:
+            texts: 要翻译的文本列表
+            target_language: 目标语言
+            special_requirements: 特殊翻译要求
+        
+        Returns:
+            翻译后的文本列表
+        """
+        # 创建异步会话
+        async with aiohttp.ClientSession() as session:
+            # 创建信号量限制并发请求数
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+            
+            async def translate_with_semaphore(text):
+                async with semaphore:
+                    return await self.translate_text_async(text, session, target_language, special_requirements, api_key)
+            
+            # 创建所有翻译任务
+            tasks = [translate_with_semaphore(text) for text in texts]
+            
+            # 等待所有任务完成
+            results = await asyncio.gather(*tasks)
+            return results
+    
+    def translate_text(self, text, target_language, special_requirements="", api_key=None):
+        """
+        同步版本的翻译函数，用于兼容现有代码
+        
+        Args:
+            text: 要翻译的文本
+            target_language: 目标语言
+            special_requirements: 特殊翻译要求
+        
+        Returns:
+            翻译后的文本
+        """
+        if not text.strip():
+            return ""
+        
+        # 使用同步方式调用异步函数
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.batch_translate_texts([text], target_language, special_requirements, api_key))[0]
+            loop.close()
+            return result
+        except Exception as e:
+            print(f"同步翻译过程中发生错误: {str(e)}")
+            return ""
+    
+    def process_docx(self, input_file_path, target_language, special_requirements, api_key=None):
+        """
+        处理Word文档，翻译其中的文本并创建双语文档
+        
+        Args:
+            input_file_path: Word文档路径
+            target_language: 目标语言
+            special_requirements: 特殊翻译要求
+            
+        Returns:
+            翻译后的Document对象
+        """
+        # 打开原始文档
+        doc = Document(input_file_path)
+        
+        # 翻译正文段落
+        total_paragraphs = len(doc.paragraphs)
+        print(f"文档共有 {total_paragraphs} 个段落")
+        
+        # 收集需要翻译的段落文本
+        paragraph_texts = []
+        paragraph_refs = []
+        
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                paragraph_texts.append(paragraph.text)
+                paragraph_refs.append(paragraph)
+        
+        # 批量并行翻译段落
+        if paragraph_texts:
+            print(f"开始批量翻译 {len(paragraph_texts)} 个段落...")
+            # 使用异步方式批量翻译
+            translated_texts = asyncio.run(self.batch_translate_texts(paragraph_texts, target_language, special_requirements, api_key))
+            
+            # 创建段落和翻译结果的映射
+            paragraphs_to_translate = []
+            for paragraph, translated_text in zip(paragraph_refs, translated_texts):
+                if translated_text.strip():
+                    paragraphs_to_translate.append((paragraph, translated_text))
+                else:
+                    print(f"  警告: 段落翻译失败，不添加翻译")
+        else:
+            paragraphs_to_translate = []
+        
+        # 现在在原文后面添加翻译文本
+        # 从后往前遍历，这样我们在添加新段落时不会影响前面的段落索引
+        for paragraph, translated_text in reversed(paragraphs_to_translate):
+            try:
+                # 使用更安全的方式插入翻译文本
+                # 直接在段落后面添加一个新段落
+                p = doc.add_paragraph()
+                # 获取原段落的父元素
+                parent_element = paragraph._p.getparent()
+                # 获取原段落在父元素中的索引
+                if parent_element is not None:
+                    index_in_parent = list(parent_element).index(paragraph._p)
+                    # 在原段落后面插入新段落
+                    parent_element.insert(index_in_parent + 1, p._p)
+            except Exception as e:
+                print(f"  警告: 插入段落时出错: {str(e)}")
+                # 如果插入失败，尝试直接在文档末尾添加段落
+                p = doc.add_paragraph()
+            
+            # 设置翻译文本和样式
+            run = p.add_run(translated_text)
+            
+            # 复制原段落的样式
+            if paragraph.style:
+                p.style = paragraph.style
+            
+            # 复制原段落的对齐方式
+            if paragraph.alignment is not None:
+                p.alignment = paragraph.alignment
+            
+            # 如果原段落有格式，复制字体格式
+            if paragraph.runs:
+                # 获取所有格式属性
+                for orig_run in paragraph.runs:
+                    if orig_run.font.size:
+                        run.font.size = orig_run.font.size
+                    if orig_run.font.name:
+                        run.font.name = orig_run.font.name
+                    # 复制加粗、斜体、下划线等格式
+                    if hasattr(orig_run.font, 'bold') and orig_run.font.bold:
+                        run.font.bold = orig_run.font.bold
+                    if hasattr(orig_run.font, 'italic') and orig_run.font.italic:
+                        run.font.italic = orig_run.font.italic
+                    if hasattr(orig_run.font, 'underline') and orig_run.font.underline:
+                        run.font.underline = orig_run.font.underline
+                    # 复制颜色
+                    if hasattr(orig_run.font, 'color') and orig_run.font.color and hasattr(orig_run.font.color, 'rgb') and orig_run.font.color.rgb:
+                        run.font.color.rgb = orig_run.font.color.rgb
+                    # 一旦找到有格式的run，就使用它的格式
+                    if any([orig_run.font.bold, orig_run.font.italic, orig_run.font.underline, orig_run.font.size]):
+                        break
+        
+        # 处理表格
+        all_table_cells = []
+        all_table_texts = []
+        
+        # 收集所有表格单元格的文本
+        for table in doc.tables:
+            print("正在处理表格...")
+            
+            for row in table.rows:
+                for cell in row.cells:
+                    # 获取单元格的文本
+                    cell_text = cell.text.strip()
+                    
+                    if cell_text:
+                        all_table_cells.append(cell)
+                        all_table_texts.append(cell_text)
+        
+        # 批量并行翻译表格单元格
+        if all_table_texts:
+            print(f"开始批量翻译 {len(all_table_texts)} 个表格单元格...")
+            # 使用异步方式批量翻译
+            translated_table_texts = asyncio.run(self.batch_translate_texts(all_table_texts, target_language, special_requirements, api_key))
+            
+            # 处理翻译结果
+            cell_translations = []
+            for cell, translated_text in zip(all_table_cells, translated_table_texts):
+                if translated_text.strip():
+                    cell_translations.append((cell, translated_text))
+                else:
+                    print(f"  警告: 表格单元格翻译失败，不添加翻译")
+            
+            # 创建一个集合来跟踪已处理的单元格，防止重复处理
+            processed_cells = set()
+            
+            # 将翻译结果添加到表格单元格中
+            for cell, translated_text in zip(all_table_cells, translated_table_texts):
+                # 使用单元格对象的ID作为唯一标识符
+                cell_id = id(cell)
+                
+                # 如果这个单元格已经处理过，则跳过
+                if cell_id in processed_cells:
+                    continue
+                    
+                # 标记这个单元格为已处理
+                processed_cells.add(cell_id)
+                
+                try:
+                    # 检查单元格是否已经包含翻译
+                    already_translated = False
+                    
+                    # 获取所有段落文本，检查是否已包含翻译
+                    all_cell_text = cell.text
+                    if translated_text.strip() in all_cell_text:
+                        print(f"  跳过已翻译的单元格内容")
+                        continue
+                    
+                    # 逐段检查是否已包含翻译
+                    for para in cell.paragraphs[1:] if len(cell.paragraphs) > 1 else []:
+                        if para.text.strip() == translated_text.strip():
+                            already_translated = True
+                            break
+                            
+                    if already_translated:
+                        continue
+                    
+                    # 添加翻译段落
+                    if len(cell.paragraphs) > 0 and cell.paragraphs[0].text.strip():
+                        # 添加新段落
+                        p = cell.add_paragraph()
+                        p.text = translated_text
+                        
+                        # 尝试应用原始段落的样式
+                        if cell.paragraphs[0].style:
+                            p.style = cell.paragraphs[0].style
+                except Exception as e:
+                    print(f"  处理表格单元格时出错: {str(e)}")
+        
+        return doc
+    
+    def call_translation_api(self, input_file_path, target_language,api_key):
+        """
+        调用app.py中的/api/translate接口来翻译文档
+        
+        Args:
+            input_file_path: 输入文档路径
+            target_language: 目标语言
+            
+        Returns:
+            翻译后的文档路径
+        """
+        import requests
+        import tempfile
+        import os
+        
+        # 创建临时文件来保存翻译后的文档
+        temp_dir = tempfile.mkdtemp()
+        output_path = os.path.join(temp_dir, f"translated_output.docx")
+        
+        # 准备API请求
+        url = "http://localhost:5005/api/translate"  # app.py运行的地址
+        
+        # 准备文件和表单数据
+        files = {
+            'file': (os.path.basename(input_file_path), open(input_file_path, 'rb'), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        }
+        data = {
+            'target_language': target_language,
+            'api_key': api_key
+        }
+        
+        try:
+            # 发送请求
+            print(f"正在调用翻译API...")
+            response = requests.post(url, files=files, data=data, stream=True)
+            
+            # 检查响应
+            if response.status_code == 200:
+                # 将响应内容保存到文件
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print(f"翻译成功，结果保存到: {output_path}")
+                return output_path
+            else:
+                print(f"翻译API调用失败: {response.status_code} - {response.text}")
+                raise Exception(f"翻译API调用失败: {response.status_code}")
+        except Exception as e:
+            print(f"调用翻译API时出错: {str(e)}")
+            raise e
+        finally:
+            # 关闭文件
+            files['file'][1].close()
+    
+    def translate_document(self, input_file_path, target_language, special_requirements,api_key):
+        """
+        Translate a Word document using GPT-4o
+        
+        Args:
+            input_file_path: Path to the input Word document
+            target_language: Target language for translation
+            special_requirements: Special translation requirements
+            
+        Returns:
+            A Document object with the translated content
+        """
+        try:
+            # 调用翻译API
+            output_path = self.call_translation_api(input_file_path, target_language,api_key)
+            
+            # 返回翻译后的文档
+            return Document(output_path)
+        except Exception as e:
+            print(f"翻译文档时出错: {str(e)}")
+            # 如果API调用失败，回退到使用本地翻译方法
+            print("尝试使用本地翻译方法...")
+            return self.process_docx(input_file_path, target_language, special_requirements, api_key)
+
 
 # 定义OCR请求模型
 ocr_request = ocr_ns.model(
@@ -544,9 +917,31 @@ class OCRExtractResource(Resource):
             print(f"OCR错误: {str(e)}")
             return f"OCR错误: {str(e)}"
 
+
+# 定义Dify QA请求模型
+dify_request = dify_ns.model(
+    "DifyRequest",
+    {
+        "api_key": fields.String(required=True, description="Dify API密钥"),
+        "question": fields.String(required=True, description="要提问的问题"),
+        "conversation_id": fields.String(required=False, description="对话ID，用于继续之前的对话"),
+    },
+)
+
+# 定义Dify QA响应模型
+dify_response = dify_ns.model(
+    "DifyResponse",
+    {
+        "answer": fields.String(description="AI回答的内容"),
+        "conversation_id": fields.String(description="对话ID"),
+        "success": fields.Boolean(description="请求是否成功")
+    },
+)
 @dify_ns.route("/qa")
 class DifyQAResource(Resource):
     @dify_ns.doc("qa_service")
+    @dify_ns.expect(dify_request)
+    @dify_ns.response(200, "成功", dify_response)
     @dify_ns.vendor(
         {
             "x-monkey-tool-name": "dify_qa",
@@ -561,6 +956,15 @@ class DifyQAResource(Resource):
             },
             "x-monkey-tool-icon": "emoji:📄:#3a8fe5",
             "x-monkey-tool-input": [
+                {
+                    "displayName": {
+                        "zh-CN": "Dify API密钥",
+                        "en-US": "Dify API Key",
+                    },
+                    "name": "api_key",
+                    "type": "string",
+                    "required": True,
+                },
                 {
                     "displayName": {
                         "zh-CN": "问题",
@@ -609,70 +1013,67 @@ class DifyQAResource(Resource):
             "x-monkey-tool-extra": {
                 "estimateTime": 5,
             },
-            "x-monkey-tool-credentials": [
-                {
-                    "name": "dify",
-                    "required": True,
-                    "description": {
-                        "zh-CN": "Dify API 密钥",
-                        "en-US": "Dify API Key"
-                    }
-                }
-            ]
         }
     )
     def post(self):
-        try:
-            # 从请求头获取 Dify API Key
-            dify_api_key = request.headers.get("x-monkey-credential-dify")
-            if not dify_api_key:
-                return {"error": "Missing Dify API key"}, 401
-
+        
             # 获取请求数据
             data = request.json
+            api_key = data.get("api_key")
+            if not api_key:
+                return {"error": "Missing Dify API key"}, 401
+                
             question = data.get("question")
             conversation_id = data.get("conversation_id", "")
-            
+
+
             if not question:
                 return {"error": "问题不能为空"}, 400
             
             # 准备请求头
             headers = {
-                "Authorization": f"Bearer {dify_api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             }
-            
+            user_id = "user-" + str(hash(datetime.now().strftime('%Y%m%d%H%M%S')))
             # 准备请求数据
             data = {
                 "inputs": {},
                 "query": question,
+                "user": user_id,
                 "response_mode": "blocking",
-                "conversation_id": conversation_id
             }
+
+            # 仅当会话ID存在且有效时才添加到请求中
+            import re
+            uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+            if conversation_id and (isinstance(conversation_id, str) and uuid_pattern.match(conversation_id)):
+                data["conversation_id"] = conversation_id
             
-            # 发送请求到Dify API
-            response = requests.post(
-                f"{DIFY_API_URL}/chat-messages",
-                headers=headers,
-                json=data
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get("answer", "抱歉，我无法回答这个问题。")
+            try:
+                # 发送请求到Dify API
+                response = requests.post(
+                    f"{DIFY_API_URL}/chat-messages",
+                    headers=headers,
+                    json=data
+                )
                 
-                # 返回结果
-                return {
-                    "answer": answer,
-                    "conversation_id": result.get("conversation_id", ""),
-                    "success": True
-                }
-            else:
-                return {"error": f"API请求失败: {response.text}"}, response.status_code
-        
-        except Exception as e:
-            error_msg = f"发生错误: {str(e)}"
-            return {"answer": error_msg, "success": False}
+                if response.status_code == 200:
+                    result = response.json()
+                    answer = result.get("answer", "抱歉，我无法回答这个问题。")
+                    
+                    # 返回结果
+                    return {
+                        "answer": answer,
+                        "conversation_id": result.get("conversation_id", ""),
+                        "success": True
+                    }
+                else:
+                    return {"error": f"API请求失败: {response.text}"}, response.status_code
+            
+            except Exception as e:
+                error_msg = f"发生错误: {str(e)}"
+                return {"answer": error_msg, "success": False}
 
 
 def extract_formulas_from_response(response_text: str) -> List[str]:
@@ -816,20 +1217,28 @@ def call_gpt_o3(json_data, api_key) -> Dict[str, Any]:
         }
         
         # 构建示例数据
+        # example_data = {
+        #   "data": [
+        #     {
+        #       "instruction": "X1X2X3:193.0,22.0,88.0",
+        #       "input": "",
+        #       "output": "Y1Y2Y3:42.18,65.42,8.9"
+        #     },
+        #     {
+        #       "instruction": "X1X2X3:243.0,175.0,76.0",
+        #       "input": "",
+        #       "output": "Y1Y2Y3:76.22,15.6,58.75"
+        #     }
+        #   ]
+        # }
         example_data = {
           "data": [
             {
-              "instruction": "X1X2X3:193.0,22.0,88.0",
-              "input": "",
-              "output": "Y1Y2Y3:42.18,65.42,8.9"
-            },
-            {
-              "instruction": "X1X2X3:243.0,175.0,76.0",
-              "input": "",
-              "output": "Y1Y2Y3:76.22,15.6,58.75"
+              
             }
           ]
         }
+        
         
         # 构建GPT-o3的提示词
         prompt = """以下是JSON格式的数据，instruction和output之间存在关联。请完成以下任务：
@@ -923,6 +1332,15 @@ class InferenceO3Resource(Resource):
             "x-monkey-tool-input": [
                 {
                     "displayName": {
+                        "zh-CN": "Cursor AI API密钥",
+                        "en-US": "Cursor AI API Key",
+                    },
+                    "name": "api_key",
+                    "type": "string",
+                    "required": True,
+                },
+                {
+                    "displayName": {
                         "zh-CN": "数据点",
                         "en-US": "Data Points",
                     },
@@ -1010,6 +1428,7 @@ class InferenceO3Resource(Resource):
         inference_ns.model(
             "DataInferenceRequest",
             {
+                "api_key": fields.String(required=True, description="Cursor AI API密钥"),
                 "data": fields.Raw(description="Any valid JSON data, including arrays and objects")
             }
         )
@@ -1033,16 +1452,16 @@ class InferenceO3Resource(Resource):
         分析数据点之间的规律和可换算的公式
         """
         try:
-            # 从请求头获取 API Key
-            api_key = request.headers.get("x-monkey-credential-cursor-ai")
-            if not api_key:
-                return {"error": "Missing API key"}, 401
-
             # 获取请求数据
             request_data = request.json
             if request_data is None:
                 return {"message": "Invalid request data. Must provide valid JSON data."}, 400
             
+            # 获取API密钥
+            api_key = request_data.get('api_key')
+            if not api_key:
+                return {"error": "Missing API key"}, 401
+                
             # 如果请求中有 data 字段，则使用该字段的值
             # 否则直接使用整个请求数据
             json_data = request_data.get('data', request_data)
