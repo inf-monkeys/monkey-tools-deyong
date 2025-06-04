@@ -15,6 +15,7 @@ import asyncio
 import aiohttp
 import re
 import time
+import urllib.parse
 from typing import List, Dict, Any
 from lxml import etree
 from werkzeug.utils import secure_filename
@@ -207,30 +208,66 @@ def get_manifest():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': '没有文件被上传'}), 400
+    file_base64 = None
+    file_type = None
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': '没有选择文件'}), 400
-    
-    # 获取文件类型
-    file_type = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
-    if file_type not in ['jpg', 'jpeg', 'png', 'bmp', 'pdf']:
-        return jsonify({'error': '不支持的文件类型'}), 400
-    
-    # 保存文件
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(file_path)
-    
-    # 将文件转换为base64编码
-    with open(file_path, 'rb') as f:
-        file_content = f.read()
-        file_base64 = base64.b64encode(file_content).decode('utf-8')
-    
-    # 删除临时文件
-    os.remove(file_path)
+    # 检查是否是从本地上传的文件
+    if 'file' in request.files and request.files['file'].filename != '':
+        file = request.files['file']
+        
+        # 获取文件类型
+        file_type = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+        if file_type not in ['jpg', 'jpeg', 'png', 'bmp', 'pdf']:
+            return jsonify({'error': '不支持的文件类型'}), 400
+        
+        # 保存文件
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        # 将文件转换为base64编码
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+            file_base64 = base64.b64encode(file_content).decode('utf-8')
+        
+        # 删除临时文件
+        os.remove(file_path)
+        
+    # 检查是否提供了CDN URL
+    elif 'cdn_url' in request.form and request.form['cdn_url'] != '':
+        cdn_url = request.form['cdn_url']
+        
+        try:
+            # 从URL获取文件内容
+            response = requests.get(cdn_url, stream=True)
+            response.raise_for_status() # 确保请求成功
+            
+            # 从URL中提取文件类型
+            content_type = response.headers.get('Content-Type', '')
+            if 'image/jpeg' in content_type:
+                file_type = 'jpg'
+            elif 'image/png' in content_type:
+                file_type = 'png'
+            elif 'image/bmp' in content_type:
+                file_type = 'bmp'
+            elif 'application/pdf' in content_type:
+                file_type = 'pdf'
+            else:
+                # 尝试从URL中获取文件扩展名
+                url_path = urllib.parse.urlparse(cdn_url).path
+                file_type = url_path.rsplit('.', 1)[1].lower() if '.' in url_path else ''
+            
+            if file_type not in ['jpg', 'jpeg', 'png', 'bmp', 'pdf']:
+                return jsonify({'error': '不支持的文件类型'}), 400
+            
+            # 将文件内容转换为base64
+            file_content = response.content
+            file_base64 = base64.b64encode(file_content).decode('utf-8')
+            
+        except requests.exceptions.RequestException as e:
+            return jsonify({'error': f'无法从CDN下载文件: {str(e)}'}), 400
+    else:
+        return jsonify({'error': '没有文件被上传或提供CDN URL'}), 400
     
     return jsonify({
         'file_base64': file_base64,
@@ -265,11 +302,11 @@ class DocumentTranslationResource(Resource):
                 },
                 {
                     "displayName": {
-                        "zh-CN": "Word文档",
-                        "en-US": "Word Document",
+                        "zh-CN": "文档CDN URL",
+                        "en-US": "Document CDN URL",
                     },
-                    "name": "document",
-                    "type": "file",
+                    "name": "document_url",
+                    "type": "string",
                     "required": True,
                 },
                 {
@@ -312,7 +349,8 @@ class DocumentTranslationResource(Resource):
         }
     )
     @ai_translation_ns.expect(
-        ai_translation_ns.parser().add_argument('document', location='files', type='file', required=True, help='Word document file')
+        ai_translation_ns.parser()
+        .add_argument('document_url', location='form', type=str, required=True, help='CDN URL to Word document')
         .add_argument('api_key', location='form', type=str, required=True, help='Cursor AI API Key')
         .add_argument('target_language', location='form', type=str, required=True, help='Target language for translation')
         .add_argument('special_requirements', location='form', type=str, required=False, help='Special translation requirements')
@@ -321,17 +359,13 @@ class DocumentTranslationResource(Resource):
         """
         Translate a Word document using GPT-4o
         
-        This endpoint accepts a Word document, translates it to the specified target language,
-        and returns a bilingual document with both the original text and the translation.
+        This endpoint accepts a Word document from a CDN URL,
+        translates it to the specified target language, and returns a bilingual document 
+        with both the original text and the translation.
         
         Returns a Word document with the translated content.
         """
         try:
-            # Get uploaded file
-            if 'document' not in request.files:
-                return {"error": "No document file provided"}, 400
-                
-            file = request.files['document']
             api_key = request.form.get('api_key')
             if not api_key:
                 return {"error": "Missing API key"}, 401
@@ -339,33 +373,53 @@ class DocumentTranslationResource(Resource):
             target_language = request.form.get('target_language')
             special_requirements = request.form.get('special_requirements', '')
             
-            if not file or not target_language:
-                return {"error": "Missing required parameters"}, 400
+            if not target_language:
+                return {"error": "Missing target language parameter"}, 400
                 
-            # 检查文件格式
-            file_name = file.filename
-            if file_name and not file_name.endswith('.docx'):
-                return {"error": "只支持 .docx 格式的文件"}, 400
-                
-            # Create a temporary file to store the uploaded document
+            # Create a temporary file to store the document
             temp_dir = tempfile.mkdtemp()
             input_file_path = os.path.join(temp_dir, f"input_{uuid.uuid4()}.docx")
             output_file_path = os.path.join(temp_dir, f"output_{uuid.uuid4()}.docx")
             
-            file.save(input_file_path)
+            file_name = None
             
-            # Process the document
+            # 检查是否提供了CDN URL
+            if 'document_url' in request.form and request.form['document_url'] != '':
+                document_url = request.form['document_url']
+                
+                # 从URL中提取文件名
+                url_path = urllib.parse.urlparse(document_url).path
+                file_name = os.path.basename(url_path)
+                if not file_name.endswith('.docx'):
+                    return {"error": "只支持 .docx 格式的文件"}, 400
+                    
+                try:
+                    # 从URL下载文件
+                    response = requests.get(document_url, stream=True)
+                    response.raise_for_status()  # 确保请求成功
+                    
+                    # 保存下载的文件
+                    with open(input_file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            
+                except requests.exceptions.RequestException as e:
+                    return {"error": f"无法从CDN URL下载文件: {str(e)}"}, 400
+            else:
+                return {"error": "未提供文档CDN URL"}, 400
+                
+            # 处理文档
             translated_doc = self.translate_document(input_file_path, target_language, special_requirements, api_key)
             translated_doc.save(output_file_path)
             
-            # Return the translated document
+            # 返回翻译后的文档
             return send_file(
                 output_file_path,
                 as_attachment=True,
-                download_name=f"translated_{file.filename}",
+                download_name=f"translated_{file_name}",
                 mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             )
-            
+                
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}, 500
