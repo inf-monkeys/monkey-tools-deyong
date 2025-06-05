@@ -7,6 +7,7 @@ import base64
 import os
 import tempfile
 import uuid
+import shutil
 from docx import Document
 import openai
 import io
@@ -109,6 +110,26 @@ ai_translation_ns = api.namespace("ai_translation", description="Document Transl
 ocr_ns = api.namespace("ocr", description="腾讯云OCR API")
 dify_ns = api.namespace("dify", description="Dify API")
 inference_ns = api.namespace("inference", description="Inference API")
+
+# Define document translation request and response models
+document_translation_request = ai_translation_ns.model(
+    "DocumentTranslationRequest",
+    {
+        "url": fields.String(required=True, description="URL of the document to translate"),
+        "target_language": fields.String(required=True, description="Target language for translation"),
+        "special_requirements": fields.String(required=False, description="Special requirements for translation"),
+        "api_key": fields.String(required=False, description="API key for translation service")
+    }
+)
+
+document_translation_response = ai_translation_ns.model(
+    "DocumentTranslationResponse",
+    {
+        "message": fields.String(description="Response message"),
+        "document_url": fields.String(description="URL to the translated document"),
+        "error": fields.String(description="Error message if any")
+    }
+)
 
 class NoSuccessfulRequestLoggingFilter(logging.Filter):
     def filter(self, record):
@@ -339,22 +360,15 @@ class DocumentTranslationResource(Resource):
                 }
             ],
             "x-monkey-tool-extra": {
-                "estimateTime": 30,
-                "provider": "GPT-4o"
+                "estimateTime": 180,
             },
-            "x-monkey-tool-extra": {
-                "estimateTime": 10,
-                "provider": "GPT-o3",
-            }
         }
     )
-    @ai_translation_ns.expect(
-        ai_translation_ns.parser()
-        .add_argument('document_url', location='form', type=str, required=True, help='CDN URL to Word document')
-        .add_argument('api_key', location='form', type=str, required=True, help='Cursor AI API Key')
-        .add_argument('target_language', location='form', type=str, required=True, help='Target language for translation')
-        .add_argument('special_requirements', location='form', type=str, required=False, help='Special translation requirements')
-    )
+    @ai_translation_ns.expect(document_translation_request)
+    @ai_translation_ns.response(200, "成功", document_translation_response)
+    @ai_translation_ns.response(400, "请求无效", document_translation_response)
+    @ai_translation_ns.response(401, "未授权", document_translation_response)
+    @ai_translation_ns.response(500, "服务器错误", document_translation_response)
     def post(self):
         """
         Translate a Word document using GPT-4o
@@ -366,63 +380,113 @@ class DocumentTranslationResource(Resource):
         Returns a Word document with the translated content.
         """
         try:
-            api_key = request.form.get('api_key')
-            if not api_key:
-                return {"error": "Missing API key"}, 401
+            # 获取JSON请求数据
+            json_data = request.json
+            if not json_data:
+                return {
+                    "file_url": "",
+                    "success": False,
+                    "message": "无效的请求数据。必须提供有效的JSON数据。"
+                }, 400
                 
-            target_language = request.form.get('target_language')
-            special_requirements = request.form.get('special_requirements', '')
+            api_key = json_data.get('api_key')
+            if not api_key:
+                return {
+                    "file_url": "",
+                    "success": False,
+                    "message": "Missing API key"
+                }, 401
+                
+            target_language = json_data.get('target_language')
+            special_requirements = json_data.get('special_requirements', '')
+            document_url = json_data.get('document_url')
             
             if not target_language:
-                return {"error": "Missing target language parameter"}, 400
+                return {
+                    "file_url": "",
+                    "success": False,
+                    "message": "Missing target language parameter"
+                }, 400
+                
+            if not document_url:
+                return {
+                    "file_url": "",
+                    "success": False,
+                    "message": "未提供文档CDN URL"
+                }, 400
                 
             # Create a temporary file to store the document
             temp_dir = tempfile.mkdtemp()
             input_file_path = os.path.join(temp_dir, f"input_{uuid.uuid4()}.docx")
             output_file_path = os.path.join(temp_dir, f"output_{uuid.uuid4()}.docx")
             
-            file_name = None
-            
-            # 检查是否提供了CDN URL
-            if 'document_url' in request.form and request.form['document_url'] != '':
-                document_url = request.form['document_url']
+            # 从URL中提取文件名
+            url_path = urllib.parse.urlparse(document_url).path
+            file_name = os.path.basename(url_path)
+            if not file_name.endswith('.docx'):
+                return {
+                    "file_url": "",
+                    "success": False,
+                    "message": "只支持 .docx 格式的文件"
+                }, 400
                 
-                # 从URL中提取文件名
-                url_path = urllib.parse.urlparse(document_url).path
-                file_name = os.path.basename(url_path)
-                if not file_name.endswith('.docx'):
-                    return {"error": "只支持 .docx 格式的文件"}, 400
-                    
-                try:
-                    # 从URL下载文件
-                    response = requests.get(document_url, stream=True)
-                    response.raise_for_status()  # 确保请求成功
-                    
-                    # 保存下载的文件
-                    with open(input_file_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                            
-                except requests.exceptions.RequestException as e:
-                    return {"error": f"无法从CDN URL下载文件: {str(e)}"}, 400
-            else:
-                return {"error": "未提供文档CDN URL"}, 400
+            try:
+                # 从URL下载文件
+                response = requests.get(document_url, stream=True)
+                response.raise_for_status()  # 确保请求成功
+                
+                # 保存下载的文件
+                with open(input_file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        
+            except requests.exceptions.RequestException as e:
+                return {
+                    "file_url": "",
+                    "success": False,
+                    "message": f"无法从CDN URL下载文件: {str(e)}"
+                }, 400
                 
             # 处理文档
             translated_doc = self.translate_document(input_file_path, target_language, special_requirements, api_key)
             translated_doc.save(output_file_path)
             
-            # 返回翻译后的文档
-            return send_file(
-                output_file_path,
-                as_attachment=True,
-                download_name=f"translated_{file_name}",
-                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            )
+            # 删除输入临时文件，但保留输出文件以供上传到S3
+            os.remove(input_file_path)
+            
+            # 创建一个持久化的输出目录，确保S3上传工具能访问到
+            output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output_files')
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 生成一个有意义的文件名，包含时间戳和原始文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            original_filename = os.path.basename(url_path)
+            filename_base, _ = os.path.splitext(original_filename)
+            persistent_filename = f"{filename_base}_{target_language}_{timestamp}.docx"
+            persistent_filepath = os.path.join(output_dir, persistent_filename)
+            
+            # 复制翻译后的文件到持久化目录
+            shutil.copy2(output_file_path, persistent_filepath)
+            
+            # 清理剩余的临时文件
+            os.remove(output_file_path)
+            os.rmdir(temp_dir)
+                
+            # 返回文件临时路径供服务器读取和上传到S3
+            return {
+                "file_path": persistent_filepath,  # 文件系统路径
+                "filename": persistent_filename,   # 文件名
+                "success": True,
+                "message": f"文档翻译成功，文件保存在 {persistent_filepath}"
+            }
                 
         except Exception as e:
             traceback.print_exc()
-            return {"error": str(e)}, 500
+            return {
+                "file_url": "",
+                "success": False,
+                "message": str(e)
+            }, 500
 
     async def translate_text_async(self, text, session, target_language, special_requirements="", api_key=None):
         """
@@ -989,6 +1053,27 @@ dify_response = dify_ns.model(
         "answer": fields.String(description="AI回答的内容"),
         "conversation_id": fields.String(description="对话ID"),
         "success": fields.Boolean(description="请求是否成功")
+    },
+)
+
+# 定义文档翻译请求模型
+document_translation_request = ai_translation_ns.model(
+    "DocumentTranslationRequest",
+    {
+        "document_url": fields.String(required=True, description="文档CDN URL，必须是.docx格式文件"),
+        "api_key": fields.String(required=True, description="Cursor AI API密钥"),
+        "target_language": fields.String(required=True, description="目标翻译语言"),
+        "special_requirements": fields.String(required=False, description="特殊翻译要求")
+    },
+)
+
+# 定义文档翻译响应模型（虽然实际响应是一个文件）
+document_translation_response = ai_translation_ns.model(
+    "DocumentTranslationResponse",
+    {
+        "file_url": fields.String(description="翻译后的文档URL"),
+        "success": fields.Boolean(description="翻译是否成功"),
+        "message": fields.String(description="处理结果信息")
     },
 )
 @dify_ns.route("/qa")
