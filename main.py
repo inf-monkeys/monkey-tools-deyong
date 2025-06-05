@@ -32,13 +32,40 @@ try:
 except ImportError:
     print("请安装腾讯云SDK: pip install tencentcloud-sdk-python")
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 api = Api(
     app,
     version="1.0",
     title="API Services",
     description="API Services including Document AI Translation and Dify QA",
 )
+
+# 导入文件服务所需模块
+from flask import send_file
+
+# 文件托管相关配置
+class Config:
+    # 文件托管目录
+    OUTPUT_FILES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output_files')
+    # 确保目录存在
+    os.makedirs(OUTPUT_FILES_DIR, exist_ok=True)
+    # 文件访问URL前缀，默认为本地开发环境
+    FILE_ACCESS_URL_PREFIX = "http://localhost:5001/files/"
+    # 文件过期时间（秒）
+    FILE_EXPIRY_SECONDS = 3600 * 24 * 7  # 7天
+    
+# 尝试从环境变量或配置文件加载配置
+try:
+    if os.path.exists('config.py'):
+        from config import Config as UserConfig
+        Config.FILE_ACCESS_URL_PREFIX = getattr(UserConfig, 'FILE_ACCESS_URL_PREFIX', Config.FILE_ACCESS_URL_PREFIX)
+        Config.FILE_EXPIRY_SECONDS = getattr(UserConfig, 'FILE_EXPIRY_SECONDS', Config.FILE_EXPIRY_SECONDS)
+    elif os.environ.get('FILE_ACCESS_URL_PREFIX'):
+        Config.FILE_ACCESS_URL_PREFIX = os.environ.get('FILE_ACCESS_URL_PREFIX')
+    
+    print(f"文件访问URL前缀: {Config.FILE_ACCESS_URL_PREFIX}")
+except Exception as e:
+    print(f"加载配置失败: {str(e)}")
 
 # 设置异步翻译的最大并发请求数
 MAX_CONCURRENT_REQUESTS = 10
@@ -105,6 +132,7 @@ UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 限制上传文件大小为16MB
+app.config['OUTPUT_FILES_DIR'] = Config.OUTPUT_FILES_DIR
 
 ai_translation_ns = api.namespace("ai_translation", description="Document Translation API")
 ocr_ns = api.namespace("ocr", description="腾讯云OCR API")
@@ -147,6 +175,12 @@ def before_request():
     request.team_id = request.headers.get("x-monkeys-teamid")
     request.workflow_id = request.headers.get("x-monkeys-workflowid")
     request.workflow_instance_id = request.headers.get("x-monkeys-workflow-instanceid")
+
+# 添加静态文件托管路由
+@app.route('/files/<path:filename>')
+def serve_file(filename):
+    """提供对文件的访问"""
+    return send_file(os.path.join(Config.OUTPUT_FILES_DIR, filename))
 
 @api.errorhandler(Exception)
 def handle_exception(error):
@@ -472,12 +506,17 @@ class DocumentTranslationResource(Resource):
             os.remove(output_file_path)
             os.rmdir(temp_dir)
                 
-            # 返回文件临时路径供服务器读取和上传到S3
+            # 生成可访问的URL
+            file_url = f"{Config.FILE_ACCESS_URL_PREFIX}{persistent_filename}"
+            
+            # 返回文件URL和相关信息
             return {
-                "file_path": persistent_filepath,  # 文件系统路径
-                "filename": persistent_filename,   # 文件名
+                "file_path": persistent_filepath,     # 本地文件系统路径（用于调试）
+                "file_url": file_url,                # 可访问的URL
+                "publicAccessUrl": file_url,         # 给S3用的公开访问URL
+                "filename": persistent_filename,      # 文件名
                 "success": True,
-                "message": f"文档翻译成功，文件保存在 {persistent_filepath}"
+                "message": f"文档翻译成功，可通过 {file_url} 访问"
             }
                 
         except Exception as e:
